@@ -1,0 +1,33 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: backendpath-postgres
+    environment:
+      POSTGRES_USER: backendpath
+      POSTGRES_PASSWORD: backendpath123
+      POSTGRES_DB: backendpath_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backendpath -d backendpath_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: backendpath-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@backendpath.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
