@@ -17,8 +17,8 @@ from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-from backendpath.backend.app.config import settings
-from backendpath.backend.app.schemas.auth import TokenData
+from app.config import settings
+from app.schemas.auth import TokenData
 
 # CryptContext cấu hình thuật toán hash mật khẩu.
 # bcrypt được chọn vì nó chậm theo thiết kế (work factor),

@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-from backendpath.backend.app.config import settings
+from app.config import settings
 
 
 # Engine là "cầu nối" giữa Python và PostgreSQL.

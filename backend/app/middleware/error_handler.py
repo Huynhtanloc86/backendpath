@@ -13,7 +13,7 @@ Thay vì mỗi route trả về format khác nhau.
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from backendpath.backend.app.exceptions import (
+from app.exceptions import (
     InvalidCredentialsError,
     ProgressNotFoundError,
     UserAlreadyExistsError,

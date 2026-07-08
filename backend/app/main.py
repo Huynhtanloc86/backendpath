@@ -16,10 +16,10 @@ Khi bạn chạy `uvicorn app.main:app`, Uvicorn:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backendpath.backend.app.exceptions import BackendPathException
-from backendpath.backend.app.middleware.error_handler import custom_exception_handler
-from backendpath.backend.app.routers import users
-from backendpath.backend.app.routers import auth, progress
+from app.exceptions import BackendPathException
+from app.middleware.error_handler import custom_exception_handler
+from app.routers import users
+from app.routers import auth, progress
 
 # Tạo FastAPI instance - đây là object trung tâm của toàn app
 app = FastAPI(

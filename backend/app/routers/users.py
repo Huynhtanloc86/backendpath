@@ -9,9 +9,9 @@ Client phải gửi JWT token hợp lệ thì mới nhận được dữ liệu.
 
 from fastapi import APIRouter, Depends
 
-from backendpath.backend.app.core.deps import get_current_user
-from backendpath.backend.app.models.user import User
-from backendpath.backend.app.schemas.user import UserResponse
+from app.core.deps import get_current_user
+from app.models.user import User
+from app.schemas.user import UserResponse
 
 router = APIRouter(prefix="/users", tags=["Users"])
 

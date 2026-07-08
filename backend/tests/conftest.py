@@ -8,9 +8,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from backendpath.backend.app.database import Base
-from backendpath.backend.app.core.deps import get_db
-from backendpath.backend.app.main import app
+from app.database import Base
+from app.core.deps import get_db
+from app.main import app
 
 # SQLite in-memory cho test - không cần PostgreSQL đang chạy
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_backendpath.db"

@@ -15,10 +15,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from backendpath.backend.app.core.deps import get_current_user, get_db
-from backendpath.backend.app.models.progress import Badge, Progress, QuizAttempt
-from backendpath.backend.app.models.user import User
-from backendpath.backend.app.schemas.progress import BadgeResponse, ProgressResponse, ProgressUpdate, QuizAttemptCreate
+from app.core.deps import get_current_user, get_db
+from app.models.progress import Badge, Progress, QuizAttempt
+from app.models.user import User
+from app.schemas.progress import BadgeResponse, ProgressResponse, ProgressUpdate, QuizAttemptCreate
 
 router = APIRouter(prefix="/progress", tags=["Progress"])
 

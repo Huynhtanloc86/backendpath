@@ -11,11 +11,11 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import Base from app.database
-from backendpath.backend.app.database import Base  # noqa: E402
+from app.database import Base  # noqa: E402
 
 # Import all models so Alembic can detect them for autogenerate
-from backendpath.backend.app.models.user import User  # noqa: E402, F401
-from backendpath.backend.app.models.progress import Progress, QuizAttempt, Badge  # noqa: E402, F401
+from app.models.user import User  # noqa: E402, F401
+from app.models.progress import Progress, QuizAttempt, Badge  # noqa: E402, F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -18,9 +18,9 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
-from backendpath.backend.app.core.security import decode_access_token
-from backendpath.backend.app.database import SessionLocal
-from backendpath.backend.app.models.user import User
+from app.core.security import decode_access_token
+from app.database import SessionLocal
+from app.models.user import User
 
 # HTTPBearer tự động đọc JWT từ header: "Authorization: Bearer <token>"
 security = HTTPBearer()
