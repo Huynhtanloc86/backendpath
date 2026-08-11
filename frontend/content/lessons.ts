@@ -1947,6 +1947,69 @@ Nginx xử lý SSL, FastAPI chỉ xử lý logic. Đây là kiến trúc phổ b
       'Tôi có thể liệt kê ít nhất 3 điều cần kiểm tra trước khi deploy production',
       'Tôi hiểu tại sao HTTPS bắt buộc và Let\'s Encrypt là gì',
     ],
+    realCodeReference: [
+      {
+        filePath: 'Dockerfile (tạo mới ở thư mục gốc backend/)',
+        codeSnippet: `# Bước 1: Base image — Python 3.11 slim để image nhỏ hơn
+FROM python:3.11-slim
+
+# Bước 2: Tạo thư mục làm việc trong container
+WORKDIR /app
+
+# Bước 3: Copy requirements trước (tận dụng Docker layer cache)
+# Chỉ copy 2 file này đầu tiên — nếu requirements.txt không đổi,
+# Docker cache bước pip install → build lại nhanh hơn nhiều
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bước 4: Copy toàn bộ code
+COPY . .
+
+# Bước 5: Expose port (documentation — không thật sự mở port)
+EXPOSE 8000
+
+# Bước 6: Lệnh chạy app — KHÔNG dùng --reload trong production
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]`,
+        explanation:
+          'Thứ tự các bước trong Dockerfile rất quan trọng: Docker cache từng layer. Đặt COPY requirements.txt và pip install TRƯỚC khi COPY code — nếu bạn chỉ sửa code (không sửa requirements), Docker bỏ qua bước pip install tốn thời gian. Flag --workers 4 chạy 4 process Uvicorn song song để xử lý nhiều request đồng thời.',
+      },
+      {
+        filePath: 'docker-compose.prod.yml (ví dụ production stack)',
+        codeSnippet: `version: '3.9'
+
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=\${DATABASE_URL}
+      - JWT_SECRET=\${JWT_SECRET}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped   # Tự restart nếu crash
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: \${DB_USER}
+      POSTGRES_PASSWORD: \${DB_PASSWORD}
+      POSTGRES_DB: \${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \${DB_USER}"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:`,
+        explanation:
+          'Trong production, env vars được truyền từ bên ngoài (không hardcode). depends_on với condition: service_healthy đảm bảo API chỉ start sau khi DB sẵn sàng nhận connection. restart: unless-stopped tự restart container nếu crash — quan trọng khi chạy 24/7.',
+      },
+    ],
   },
 
   // ─── STAGE 4: NÂNG CAO ──────────────────────────────────────────────────
@@ -2122,6 +2185,862 @@ engine = create_engine(
       'Tôi biết database index hoạt động thế nào và trade-off của nó',
       'Tôi hiểu tại sao không nên optimize sớm (premature optimization)',
       'Tôi biết Load Balancer đứng ở đâu trong kiến trúc và làm gì',
+    ],
+    realCodeReference: [
+      {
+        filePath: 'backend/app/database.py',
+        codeSnippet: `from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+from app.config import settings
+
+# Connection Pool: tái sử dụng DB connection thay vì mở mới mỗi request
+# pool_size=10  → 10 connection luôn mở sẵn
+# max_overflow=20 → tối đa thêm 20 connection khi cần (tổng 30)
+# pool_pre_ping=True → kiểm tra connection còn sống trước khi dùng
+engine = create_engine(
+    settings.database_url,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()`,
+        explanation:
+          'Connection pool là một trong những cách đơn giản nhất để tăng performance. Mở DB connection tốn ~100ms. Với pool_size=10, 10 request đầu tiên dùng connection có sẵn (~1ms). pool_pre_ping=True tránh lỗi "connection already closed" khi connection bị timeout sau thời gian idle.',
+      },
+      {
+        filePath: 'backend/app/models/user.py (index trên cột email)',
+        codeSnippet: `from sqlalchemy import Column, String, DateTime
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # index=True → SQLAlchemy tự tạo B-tree index trên cột này
+    # Tại sao? Vì login query WHERE email = '...' chạy rất thường xuyên
+    # Không có index: full table scan O(n) — 1M users = scan 1M rows
+    # Có index: O(log n) — 1M users = ~20 bước so sánh
+    email = Column(String, unique=True, nullable=False, index=True)
+
+    hashed_password = Column(String, nullable=False)
+    display_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)`,
+        explanation:
+          'Cột email được index vì login và các lookup theo email xảy ra liên tục. unique=True tự động tạo unique index — không cần thêm index=True riêng. Với bảng users 1 triệu dòng: không có index cần scan toàn bộ mỗi lần login; có index tìm trong ~20 bước. Trade-off: INSERT/UPDATE chậm hơn ~10-20% vì phải maintain index.',
+      },
+      {
+        filePath: 'Ví dụ Redis caching (thêm vào router)',
+        codeSnippet: `import json
+import redis
+from app.config import settings
+
+# Kết nối Redis (chạy riêng, thường port 6379)
+redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: str, db: Session = Depends(get_db)):
+    cache_key = f"user:{user_id}"
+
+    # 1. Kiểm tra cache trước
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)   # ~0.1ms — không chạm DB
+
+    # 2. Cache miss → query DB
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404)
+
+    # 3. Lưu vào cache 5 phút (300 giây)
+    # setex = SET with EXpiry
+    redis_client.setex(cache_key, 300, json.dumps({
+        "id": str(user.id),
+        "email": user.email,
+        "display_name": user.display_name,
+    }))
+
+    return user`,
+        explanation:
+          'Cache-aside pattern: check cache → miss → query DB → write cache. TTL 300 giây (5 phút) là trade-off giữa freshness và performance. Khi user update profile, cần xóa cache key đó (cache invalidation). Redis phù hợp cho data đọc nhiều, ít thay đổi như user profile, product info, configuration.',
+      },
+    ],
+  },
+
+  // ─── STAGE 2 BỔ SUNG: PAGINATION ────────────────────────────────────────
+  {
+    id: 'pagination',
+    stageId: 2,
+    title: 'Pagination & Filtering',
+    shortDescription: 'Xử lý danh sách dữ liệu lớn đúng cách với limit/offset và cursor',
+    intro:
+      'Khi database có 1 triệu bản ghi, bạn không thể trả về tất cả trong 1 response. Pagination là kỹ năng bắt buộc của bất kỳ API production nào.',
+    theory: `## Pagination & Filtering
+
+### Tại sao cần pagination?
+
+\`\`\`python
+# BAD — không bao giờ làm thế này
+users = db.query(User).all()   # 1 triệu users → RAM explosion, timeout
+
+# GOOD
+users = db.query(User).limit(20).offset(0).all()  # Chỉ lấy 20
+\`\`\`
+
+Không có pagination:
+- Response size không kiểm soát được (có thể GB)
+- Database load cực cao
+- Client timeout
+- UX tệ — user chờ load toàn bộ dữ liệu
+
+### Offset Pagination (Phổ biến nhất)
+
+\`\`\`python
+GET /users?page=2&limit=20
+# → OFFSET 20 LIMIT 20 (bỏ qua 20 đầu, lấy 20 tiếp theo)
+
+GET /users?skip=0&limit=20   # Cách khác — dùng skip thay page
+\`\`\`
+
+\`\`\`python
+@router.get("/users")
+def list_users(
+    skip: int = Query(default=0, ge=0),        # ge=0: không âm
+    limit: int = Query(default=20, le=100),    # le=100: tối đa 100
+    db: Session = Depends(get_db),
+):
+    total = db.query(User).count()
+    users = db.query(User).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "data": users,
+    }
+\`\`\`
+
+**Ưu điểm**: Đơn giản, dễ implement, hỗ trợ jump to page.
+
+**Nhược điểm**:
+- Chậm với offset lớn (OFFSET 100000 vẫn scan 100000 rows rồi bỏ)
+- Unstable khi data thay đổi (insert/delete làm lệch trang)
+
+### Cursor Pagination (Cho realtime data)
+
+Thay vì dùng số trang, dùng "con trỏ" — thường là ID hoặc timestamp của item cuối cùng:
+
+\`\`\`python
+GET /posts?cursor=&limit=20          # Trang đầu
+GET /posts?cursor=abc123&limit=20    # Trang tiếp — cursor từ response trước
+\`\`\`
+
+\`\`\`python
+@router.get("/posts")
+def list_posts(
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=20, le=100),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Post).order_by(Post.created_at.desc())
+
+    if cursor:
+        # Decode cursor (thường là base64 của timestamp hoặc ID)
+        cursor_time = decode_cursor(cursor)
+        query = query.filter(Post.created_at < cursor_time)
+
+    posts = query.limit(limit + 1).all()   # Lấy thêm 1 để biết còn page tiếp không
+
+    has_more = len(posts) > limit
+    if has_more:
+        posts = posts[:limit]
+
+    next_cursor = encode_cursor(posts[-1].created_at) if has_more else None
+
+    return {
+        "data": posts,
+        "next_cursor": next_cursor,   # None = đã hết data
+        "has_more": has_more,
+    }
+\`\`\`
+
+**Ưu điểm**: Stable khi data thay đổi, O(1) thay vì O(n) với offset lớn.
+
+**Nhược điểm**: Không jump to page được, cursor phải opaque với client.
+
+### Filtering & Sorting
+
+Kết hợp pagination với filter/sort:
+
+\`\`\`python
+@router.get("/users")
+def list_users(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, le=100),
+    search: str | None = Query(default=None),    # Tìm theo tên
+    sort_by: str = Query(default="created_at"),  # Cột sort
+    order: str = Query(default="desc"),          # asc/desc
+    db: Session = Depends(get_db),
+):
+    query = db.query(User)
+
+    # Filter
+    if search:
+        query = query.filter(
+            User.display_name.ilike(f"%{search}%")  # ilike = case-insensitive
+        )
+
+    # Sort
+    sort_col = getattr(User, sort_by, User.created_at)
+    if order == "desc":
+        query = query.order_by(sort_col.desc())
+    else:
+        query = query.order_by(sort_col.asc())
+
+    total = query.count()
+    users = query.offset(skip).limit(limit).all()
+
+    return {"total": total, "data": users}
+\`\`\`
+
+### Response format chuẩn
+
+\`\`\`json
+{
+  "total": 1000,
+  "skip": 40,
+  "limit": 20,
+  "data": [...]
+}
+\`\`\`
+
+Client dùng \`total\` để tính số trang: \`Math.ceil(total / limit)\``,
+    commonMistakes: [
+      {
+        mistake: 'Không giới hạn limit: GET /users?limit=999999 — client request toàn bộ database',
+        fix: 'Luôn dùng le= (less than or equal) trong Query() để cap limit: limit: int = Query(default=20, le=100). Kể cả authenticated user, không cho phép lấy quá 100-200 items/request.',
+      },
+      {
+        mistake: 'Trả về tổng count trong mọi request — tốn kém với bảng lớn',
+        fix: 'COUNT(*) trên bảng 10 triệu dòng tốn ~500ms. Cân nhắc: chỉ trả count khi client request (query param include_count=true), hoặc dùng cursor pagination (không cần count), hoặc cache count riêng.',
+      },
+    ],
+    quiz: [
+      {
+        id: 'q1',
+        question: 'Tại sao không nên trả về toàn bộ data từ database trong một response?',
+        options: [
+          'Vì FastAPI không hỗ trợ response lớn',
+          'Vì bảng có thể có hàng triệu bản ghi — gây timeout, tốn RAM, UX tệ',
+          'Vì JSON không encode được nhiều hơn 1000 items',
+          'Vì HTTP giới hạn response ở 1MB',
+        ],
+        correctIndex: 1,
+        explanation: 'Không có giới hạn kỹ thuật nào cản việc trả về 1 triệu records, nhưng nó gây: DB load cao, response MB-GB, client timeout, UX tệ. Pagination là convention bắt buộc cho production API.',
+      },
+      {
+        id: 'q2',
+        question: 'Vấn đề chính của offset pagination với offset lớn (ví dụ OFFSET 500000) là gì?',
+        options: [
+          'SQLAlchemy không hỗ trợ offset lớn hơn 1000',
+          'Database phải scan và bỏ qua 500000 rows đầu — vẫn chậm dù không trả về',
+          'HTTP không hỗ trợ số trang lớn',
+          'Không có vấn đề gì — OFFSET luôn O(1)',
+        ],
+        correctIndex: 1,
+        explanation: 'OFFSET 500000 LIMIT 20 = database scan 500020 rows, trả về 20, bỏ 500000. Đây là lý do cursor pagination ra đời — cursor jump thẳng đến vị trí tiếp theo mà không scan rows trước đó.',
+      },
+      {
+        id: 'q3',
+        question: 'Cursor pagination phù hợp nhất với loại data nào?',
+        options: [
+          'Data cần jump to page (trang 5, trang 10...)',
+          'Data realtime liên tục thêm mới như social feed, comment, notification',
+          'Data cần sort theo nhiều cột khác nhau',
+          'Data có số lượng cố định không thay đổi',
+        ],
+        correctIndex: 1,
+        explanation: 'Offset pagination unstable với realtime data: nếu có post mới được insert, trang 2 sẽ bao gồm item cuối trang 1 → duplicate. Cursor anchor vào ID/timestamp cụ thể, stable dù data thay đổi.',
+      },
+      {
+        id: 'q4',
+        question: 'Query param nào dưới đây được validate đúng cách?',
+        options: [
+          'limit: int = Query(default=20)',
+          'limit: int (không có Query, không validate)',
+          'limit: int = Query(default=20, ge=1, le=100)',
+          'limit = 20 (hardcode, không cho client thay đổi)',
+        ],
+        correctIndex: 2,
+        explanation: 'ge=1 (greater or equal 1) và le=100 (less or equal 100) đảm bảo client không thể request limit=0 hay limit=1000000. FastAPI tự validate và trả 422 nếu vi phạm — không cần if/else trong code.',
+      },
+    ],
+    selfCheckList: [
+      'Tôi hiểu tại sao phải paginate thay vì trả về toàn bộ data',
+      'Tôi biết cách implement offset pagination với skip và limit trong FastAPI',
+      'Tôi có thể giải thích sự khác biệt giữa offset và cursor pagination',
+      'Tôi biết cách thêm filter (WHERE) và sort (ORDER BY) vào query',
+      'Tôi luôn cap limit bằng le= để tránh client request quá nhiều data',
+    ],
+    realCodeReference: [
+      {
+        filePath: 'backend/app/routers/progress.py (ví dụ pattern pagination)',
+        codeSnippet: `from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+from app.core.deps import get_db, get_current_user
+from app.models.user import User
+from app.models.progress import Progress
+
+router = APIRouter(prefix="/progress", tags=["progress"])
+
+# Endpoint hiện tại — trả về toàn bộ progress của user
+# Ổn vì 1 user chỉ có ~12 progress records (1 per lesson)
+@router.get("")
+def get_all_progress(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    records = db.query(Progress).filter(
+        Progress.user_id == current_user.id
+    ).all()
+    return records
+
+# Nếu cần paginate — ví dụ với quiz_attempts (có thể rất nhiều)
+@router.get("/attempts")
+def get_quiz_attempts(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, le=100),
+    node_id: str | None = Query(default=None),  # Filter tùy chọn
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.models.progress import QuizAttempt
+
+    query = db.query(QuizAttempt).filter(
+        QuizAttempt.user_id == current_user.id
+    )
+    if node_id:
+        query = query.filter(QuizAttempt.node_id == node_id)
+
+    query = query.order_by(QuizAttempt.attempted_at.desc())
+
+    total = query.count()
+    attempts = query.offset(skip).limit(limit).all()
+
+    return {"total": total, "skip": skip, "limit": limit, "data": attempts}`,
+        explanation:
+          'Endpoint /progress hiện tại không cần pagination vì mỗi user có đúng 12 progress records (1 per lesson). Nhưng /progress/attempts cần — user chăm chỉ có thể làm quiz hàng trăm lần. Pattern: count() trước để biết total, sau đó offset/limit để lấy page hiện tại. Filter node_id là optional — khi truyền thì lọc theo bài học cụ thể.',
+      },
+    ],
+  },
+
+  // ─── STAGE 3 BỔ SUNG: DATABASE MIGRATIONS ────────────────────────────────
+  {
+    id: 'migrations',
+    stageId: 3,
+    title: 'Database Migrations với Alembic',
+    shortDescription: 'Thay đổi schema database an toàn mà không mất data',
+    intro:
+      'Schema database thay đổi theo thời gian — thêm cột, đổi kiểu dữ liệu, tạo bảng mới. Alembic giúp bạn làm điều đó có kiểm soát, không phải xóa database rồi tạo lại.',
+    theory: `## Database Migrations với Alembic
+
+### Vấn đề: Schema thay đổi theo thời gian
+
+Khi app phát triển, database schema cũng thay đổi:
+- Thêm cột \`phone_number\` vào bảng \`users\`
+- Đổi kiểu \`age\` từ \`VARCHAR\` → \`INTEGER\`
+- Tạo bảng \`notifications\` mới
+
+Bạn không thể chỉ sửa model Python rồi restart app — database schema cũ vẫn còn đó. Cần có cơ chế apply thay đổi vào database thật.
+
+### Alembic là gì?
+
+Alembic là migration tool cho SQLAlchemy. Nó:
+1. Track schema hiện tại của database
+2. Tạo migration script mô tả thay đổi
+3. Apply migration theo thứ tự (upgrade)
+4. Rollback về phiên bản trước nếu cần (downgrade)
+
+### Cấu trúc
+
+\`\`\`
+alembic/
+├── env.py           # Config: kết nối Alembic với SQLAlchemy models
+├── alembic.ini      # Cấu hình (database URL, script location)
+└── versions/
+    ├── 0001_initial_schema.py   # Migration đầu tiên — tạo tất cả bảng
+    ├── 0002_add_phone.py        # Thêm cột phone
+    └── 0003_create_notifications.py
+\`\`\`
+
+### Workflow hàng ngày
+
+\`\`\`bash
+# 1. Sửa model Python (thêm field vào User, tạo Model mới...)
+
+# 2. Tạo migration script tự động
+alembic revision --autogenerate -m "add phone to users"
+# → Alembic so sánh models Python với schema DB thật, tạo diff
+
+# 3. Xem migration vừa tạo (luôn review trước khi apply)
+cat alembic/versions/xxxx_add_phone_to_users.py
+
+# 4. Apply migration
+alembic upgrade head   # head = migration mới nhất
+
+# 5. Nếu có lỗi, rollback
+alembic downgrade -1   # -1 = lùi 1 bước
+\`\`\`
+
+### Anatomy của một migration file
+
+\`\`\`python
+"""add phone to users
+
+Revision ID: a1b2c3d4e5f6
+Revises: 9z8y7x6w5v4u   # ID của migration trước
+Create Date: 2024-01-15
+"""
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade() -> None:
+    # Thêm cột — nullable=True để không phá dữ liệu hiện có
+    op.add_column('users',
+        sa.Column('phone_number', sa.String(), nullable=True)
+    )
+
+def downgrade() -> None:
+    # Có thể undo upgrade này
+    op.drop_column('users', 'phone_number')
+\`\`\`
+
+Mỗi migration có \`upgrade()\` và \`downgrade()\` — nên luôn viết cả hai.
+
+### Quy tắc vàng
+
+**Không bao giờ** sửa migration đã được apply (đặc biệt trong production):
+- Đồng nghiệp đã chạy migration cũ → sửa nó = out of sync
+- Tạo migration mới để fix sai lầm
+
+**Luôn test downgrade**:
+\`\`\`bash
+alembic downgrade -1 && alembic upgrade head
+\`\`\`
+
+**Thận trọng khi thêm NOT NULL column**:
+\`\`\`python
+# NGUY HIỂM — sẽ fail nếu bảng đã có data
+op.add_column('users', sa.Column('age', sa.Integer(), nullable=False))
+
+# AN TOÀN — thêm nullable trước, backfill data, rồi set NOT NULL sau
+op.add_column('users', sa.Column('age', sa.Integer(), nullable=True))
+op.execute("UPDATE users SET age = 0 WHERE age IS NULL")  # backfill
+op.alter_column('users', 'age', nullable=False)
+\`\`\`
+
+### Các lệnh thường dùng
+
+\`\`\`bash
+alembic current          # Xem database đang ở revision nào
+alembic history          # Xem toàn bộ lịch sử migration
+alembic upgrade head     # Apply tất cả migration chưa chạy
+alembic downgrade -1     # Rollback 1 bước
+alembic downgrade base   # Rollback về trạng thái ban đầu (xóa hết)
+\`\`\``,
+    commonMistakes: [
+      {
+        mistake: 'Thêm NOT NULL column vào bảng đã có data — app crash khi apply migration',
+        fix: 'Luôn thêm cột mới với nullable=True trước. Sau đó chạy UPDATE để backfill giá trị default cho các row cũ. Cuối cùng mới alter_column sang NOT NULL. Đây là 3-step safe migration pattern.',
+      },
+      {
+        mistake: 'Không commit alembic/versions/ lên git — team member không có migration',
+        fix: 'Thư mục alembic/versions/ phải được commit. Khi người khác pull code và chạy "alembic upgrade head", họ sẽ có schema mới nhất. Chỉ .env không commit — không phải migration files.',
+      },
+    ],
+    quiz: [
+      {
+        id: 'q1',
+        question: 'Tại sao cần Alembic thay vì chỉ sửa model Python rồi restart app?',
+        options: [
+          'Vì FastAPI không đọc model Python khi restart',
+          'Vì database schema độc lập với Python code — sửa model không tự động sửa schema DB thật',
+          'Vì Alembic nhanh hơn SQLAlchemy create_all()',
+          'Vì cần Alembic để tạo model Python',
+        ],
+        correctIndex: 1,
+        explanation: 'SQLAlchemy models mô tả schema mong muốn trong Python. Database thật là hệ thống riêng biệt. Alembic là cầu nối: nó tạo SQL ALTER TABLE, CREATE TABLE... để đồng bộ DB với model.',
+      },
+      {
+        id: 'q2',
+        question: 'Lệnh nào apply tất cả migration chưa được chạy?',
+        options: [
+          'alembic run --all',
+          'alembic upgrade head',
+          'alembic migrate --latest',
+          'alembic apply versions/',
+        ],
+        correctIndex: 1,
+        explanation: '"head" là alias cho revision mới nhất. alembic upgrade head apply tất cả migration từ current revision đến head theo đúng thứ tự. Đây là lệnh chạy sau mỗi lần pull code có migration mới.',
+      },
+      {
+        id: 'q3',
+        question: 'Khi nào nguy hiểm khi thêm cột NOT NULL vào bảng production đang chạy?',
+        options: [
+          'Luôn an toàn — Alembic tự xử lý',
+          'Chỉ nguy hiểm khi bảng có hơn 1 triệu rows',
+          'Khi bảng đã có data — các row cũ không có giá trị cho cột mới → DB reject',
+          'Không nguy hiểm nếu dùng --autogenerate',
+        ],
+        correctIndex: 2,
+        explanation: 'NOT NULL constraint nghĩa là mọi row phải có giá trị. Các row cũ không có giá trị cho cột mới → database raise error. Safe migration: thêm nullable=True → backfill data → alter sang NOT NULL.',
+      },
+      {
+        id: 'q4',
+        question: 'Điều gì xảy ra khi bạn chạy "alembic downgrade -1"?',
+        options: [
+          'Xóa toàn bộ database',
+          'Rollback 1 migration — chạy hàm downgrade() của migration gần nhất',
+          'Tạo migration mới với nội dung ngược lại',
+          'Downgrade phiên bản Alembic',
+        ],
+        correctIndex: 1,
+        explanation: '-1 có nghĩa là "lùi 1 bước". Alembic chạy hàm downgrade() của migration hiện tại — thường là DROP COLUMN, DROP TABLE... Đây là cách rollback khi migration mới có lỗi.',
+      },
+    ],
+    selfCheckList: [
+      'Tôi hiểu tại sao cần migration tool thay vì chỉ sửa Python model',
+      'Tôi biết cách tạo migration mới với alembic revision --autogenerate',
+      'Tôi luôn review migration file trước khi chạy alembic upgrade head',
+      'Tôi biết 3-step pattern để thêm NOT NULL column an toàn',
+      'Tôi hiểu tại sao phải commit alembic/versions/ lên git',
+    ],
+    realCodeReference: [
+      {
+        filePath: 'backend/alembic/versions/0001_initial_schema.py',
+        codeSnippet: `"""initial schema
+
+Revision ID: a1b2c3d4e5f6
+Revises:
+Create Date: 2024-01-01
+"""
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+def upgrade() -> None:
+    # Tạo bảng users
+    op.create_table('users',
+        sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column('email', sa.String(), nullable=False),
+        sa.Column('hashed_password', sa.String(), nullable=False),
+        sa.Column('display_name', sa.String(), nullable=True),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('email'),
+    )
+    # Index riêng trên email để tăng tốc query theo email
+    op.create_index('ix_users_email', 'users', ['email'])
+
+    # Tạo bảng progress
+    op.create_table('progress',
+        sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column('node_id', sa.String(), nullable=False),
+        sa.Column('theory_read', sa.Boolean(), default=False),
+        sa.Column('quiz_best_score', sa.Float(), default=0.0),
+        sa.Column('completed', sa.Boolean(), default=False),
+        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('user_id', 'node_id', name='uq_progress_user_node'),
+    )
+
+def downgrade() -> None:
+    op.drop_table('progress')
+    op.drop_index('ix_users_email', table_name='users')
+    op.drop_table('users')`,
+        explanation:
+          'Migration đầu tiên tạo toàn bộ schema. Đây là "source of truth" cho database — ai clone repo và chạy "alembic upgrade head" sẽ có schema y hệt production. UniqueConstraint("user_id", "node_id") đảm bảo mỗi user chỉ có 1 progress record cho mỗi bài học — dùng UPSERT thay vì INSERT khi update.',
+      },
+    ],
+  },
+
+  // ─── STAGE 3 BỔ SUNG: LOGGING ────────────────────────────────────────────
+  {
+    id: 'logging',
+    stageId: 3,
+    title: 'Logging & Observability',
+    shortDescription: 'Biết app đang làm gì — debug production không cần SSH vào server',
+    intro:
+      'Khi app lỗi trên production lúc 3 giờ sáng, log là thứ duy nhất giúp bạn tìm ra nguyên nhân. Không có log = mù.',
+    theory: `## Logging & Observability
+
+### Tại sao print() không đủ?
+
+\`\`\`python
+# Development — OK
+print("User logged in:", user_id)
+
+# Production — vấn đề:
+# - Không có timestamp → không biết lỗi xảy ra lúc nào
+# - Không có level → không biết đây là info hay error
+# - Không thể filter → 10000 dòng print, tìm lỗi như tìm kim trong đống rơm
+# - Không ghi ra file → restart app = mất hết
+\`\`\`
+
+### Python logging module
+
+\`\`\`python
+import logging
+
+# Cấu hình cơ bản
+logging.basicConfig(
+    level=logging.INFO,                    # Chỉ log INFO trở lên
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)      # Logger riêng cho mỗi module
+
+# Các level (thứ tự tăng dần độ nghiêm trọng)
+logger.debug("Chi tiết debug — chỉ bật khi cần investigate")
+logger.info("Sự kiện bình thường — user login, request served")
+logger.warning("Bất thường nhưng không lỗi — deprecated API dùng")
+logger.error("Lỗi nhưng app vẫn chạy — payment failed")
+logger.critical("Lỗi nghiêm trọng — database down")
+\`\`\`
+
+### Log Levels — Cái nào dùng khi nào?
+
+| Level | Khi nào dùng | Production? |
+|-------|-------------|-------------|
+| DEBUG | Giá trị biến, flow chi tiết | Tắt |
+| INFO | Request đến, user login/logout, job hoàn thành | Bật |
+| WARNING | Retry lần 2, deprecated endpoint, slow query | Bật |
+| ERROR | Exception bị catch, third-party API lỗi | Bật |
+| CRITICAL | DB không connect được, service down | Bật |
+
+### Structured Logging — Log dạng JSON
+
+Thay vì log text thuần, log JSON để dễ query và filter:
+
+\`\`\`python
+import json
+import logging
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_data, ensure_ascii=False)
+
+# Output:
+# {"timestamp": "2024-01-15 10:30:00", "level": "ERROR",
+#  "logger": "app.routers.auth", "message": "Login failed for user@example.com"}
+\`\`\`
+
+Với JSON log, bạn có thể query trên Cloudwatch, Datadog, Grafana Loki:
+- \`level:ERROR\` → tất cả lỗi
+- \`logger:app.routers.auth AND level:WARNING\` → cụ thể hơn
+
+### Logging trong FastAPI
+
+\`\`\`python
+# app/main.py
+import logging
+from fastapi import FastAPI, Request
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
+
+app = FastAPI()
+
+# Middleware log mọi request
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration_ms = (time.time() - start) * 1000
+
+    # Log mọi request với method, path, status, thời gian
+    logger.info(
+        f"{request.method} {request.url.path} "
+        f"→ {response.status_code} ({duration_ms:.0f}ms)"
+    )
+    return response
+\`\`\`
+
+\`\`\`python
+# app/routers/auth.py
+logger = logging.getLogger(__name__)   # tên: "app.routers.auth"
+
+@router.post("/auth/login")
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == data.email).first()
+
+    if not user or not verify_password(data.password, user.hashed_password):
+        # Log failed login — useful để phát hiện brute force
+        logger.warning(f"Failed login attempt for: {data.email}")
+        raise InvalidCredentialsError()
+
+    logger.info(f"User logged in: {user.id}")   # Log user_id, không log email/password
+    return {"access_token": create_access_token(user.id)}
+\`\`\`
+
+### Những gì KHÔNG nên log
+
+\`\`\`python
+# NGUY HIỂM — vi phạm privacy và security
+logger.info(f"User {user.email} logged in with password {data.password}")
+logger.debug(f"JWT token: {token}")
+logger.info(f"DB query with: {user.hashed_password}")
+
+# AN TOÀN — chỉ log ID và non-sensitive info
+logger.info(f"User {user.id} logged in")
+logger.error(f"Auth failed for email: {data.email[:3]}***")  # Mask email
+\`\`\`
+
+Không log: password, token, hashed_password, credit card, CCCD, thông tin cá nhân đầy đủ.
+
+### Log trong Production
+
+\`\`\`bash
+# Xem log realtime (khi dùng Docker)
+docker logs -f backendpath-api
+
+# Lọc chỉ ERROR
+docker logs backendpath-api 2>&1 | grep "ERROR"
+
+# Lưu log ra file
+uvicorn app.main:app --log-level info >> /var/log/app.log 2>&1
+\`\`\`
+
+Trong production thật, dùng centralized logging:
+- **AWS CloudWatch** — nếu dùng AWS
+- **Grafana Loki** — self-hosted, tích hợp với Grafana dashboard
+- **Datadog / Sentry** — SaaS, dễ setup, có alert tự động`,
+    commonMistakes: [
+      {
+        mistake: 'Log thông tin nhạy cảm: password, token, thông tin cá nhân vào log file',
+        fix: 'Log files thường được chia sẻ với team, đưa vào monitoring system, hoặc lưu lâu dài. Password/token trong log = security incident. Chỉ log user_id, email bị mask, action. Không bao giờ log credentials.',
+      },
+      {
+        mistake: 'Dùng level DEBUG cho tất cả — log spam không dùng được',
+        fix: 'DEBUG nên tắt trong production (gây noise và performance impact). INFO cho normal operations, WARNING cho anomalies, ERROR cho failures. Khi cần investigate, bật DEBUG tạm thời cho service cụ thể.',
+      },
+    ],
+    quiz: [
+      {
+        id: 'q1',
+        question: 'Tại sao print() không đủ tốt cho production logging?',
+        options: [
+          'Vì print() bị Python deprecated trong Python 3',
+          'Vì print() không có timestamp, level, không thể filter, và không ghi ra file có cấu trúc',
+          'Vì print() quá chậm cho production',
+          'Vì print() không hoạt động trong Docker',
+        ],
+        correctIndex: 1,
+        explanation: 'print() thiếu metadata quan trọng: timestamp (khi nào lỗi?), level (nghiêm trọng thế nào?), logger name (module nào?). Không thể filter "chỉ xem ERROR" hay "chỉ xem auth module". Logging module cung cấp tất cả những điều này.',
+      },
+      {
+        id: 'q2',
+        question: 'Log level nào phù hợp khi user đăng nhập thành công?',
+        options: [
+          'DEBUG — đây là thông tin chi tiết',
+          'INFO — đây là sự kiện bình thường quan trọng',
+          'WARNING — login là hành động đáng chú ý',
+          'ERROR — nếu không có lỗi thì không cần log',
+        ],
+        correctIndex: 1,
+        explanation: 'User login là normal business event — dùng INFO. DEBUG cho chi tiết debug (giá trị biến, query params). WARNING cho bất thường (retry, slow query). ERROR cho lỗi thật. INFO events tạo audit trail: ai login lúc nào.',
+      },
+      {
+        id: 'q3',
+        question: 'Thông tin nào KHÔNG nên xuất hiện trong log?',
+        options: [
+          'User ID (UUID)',
+          'HTTP method và path',
+          'Password và JWT token',
+          'Thời gian xử lý request (ms)',
+        ],
+        correctIndex: 2,
+        explanation: 'Password và token trong log = security incident. Log files được share với team, lưu vào cloud services, retention có thể nhiều tháng. Nếu log bị leak, attacker có credential thật. Chỉ log non-sensitive identifiers như UUID.',
+      },
+      {
+        id: 'q4',
+        question: 'Lợi ích chính của structured logging (JSON format) so với text thuần?',
+        options: [
+          'JSON log nhỏ hơn text log',
+          'JSON log đẹp hơn khi đọc bằng mắt thường',
+          'Có thể query và filter theo field cụ thể: level:ERROR, user_id:abc123',
+          'JSON log không cần timestamp',
+        ],
+        correctIndex: 2,
+        explanation: 'Với text log, tìm kiếm chỉ là grep string. Với JSON log, monitoring tools (Datadog, CloudWatch Insights) hiểu structure: filter level=ERROR AND duration_ms > 1000 để tìm slow requests có lỗi. Đây là nền tảng của observability.',
+      },
+    ],
+    selfCheckList: [
+      'Tôi biết tại sao print() không phù hợp cho production và khi nào nên dùng logging',
+      'Tôi có thể chọn đúng log level (DEBUG/INFO/WARNING/ERROR/CRITICAL) cho từng tình huống',
+      'Tôi không bao giờ log password, token, hoặc thông tin nhạy cảm',
+      'Tôi biết cách thêm request logging middleware vào FastAPI',
+      'Tôi hiểu structured logging (JSON) hữu ích hơn text log như thế nào',
+    ],
+    realCodeReference: [
+      {
+        filePath: 'backend/app/middleware/error_handler.py (thêm logging vào error handler)',
+        codeSnippet: `import logging
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from app.exceptions import (
+    BackendPathException, UserNotFoundError,
+    InvalidCredentialsError, UserAlreadyExistsError,
+)
+
+# Logger riêng cho middleware — tên sẽ là "app.middleware.error_handler"
+logger = logging.getLogger(__name__)
+
+async def custom_exception_handler(request: Request, exc: BackendPathException):
+    # Map exception type → HTTP status code và error code
+    handlers = {
+        UserNotFoundError: (404, "USER_NOT_FOUND"),
+        InvalidCredentialsError: (401, "INVALID_CREDENTIALS"),
+        UserAlreadyExistsError: (409, "USER_ALREADY_EXISTS"),
+    }
+
+    status_code, error_code = handlers.get(type(exc), (500, "INTERNAL_ERROR"))
+
+    # Log error với context đủ để debug
+    if status_code >= 500:
+        # Server errors — log ERROR vì cần action ngay
+        logger.error(
+            f"Server error on {request.method} {request.url.path}: "
+            f"{error_code} - {str(exc)}"
+        )
+    else:
+        # Client errors (4xx) — log WARNING, không phải lỗi của server
+        logger.warning(
+            f"Client error on {request.method} {request.url.path}: "
+            f"{error_code}"
+        )
+
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": error_code, "message": str(exc)},
+    )`,
+        explanation:
+          'Phân biệt 4xx và 5xx khi log rất quan trọng. 4xx errors (401, 404, 409) là client làm sai — dùng WARNING. 5xx errors là server lỗi — dùng ERROR và cần alert ngay. Log đủ context: method, path, error_code. Không log request body hay headers vì có thể chứa password/token.',
+      },
     ],
   },
 ]
